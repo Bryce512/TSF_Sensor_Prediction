@@ -3,7 +3,7 @@
 
 # COMMAND ----------
 
-# DBTITLE 1,Last-20 summaries and a small class-2 list
+# DBTITLE 1,Last-20 summaries, then the cheaper call
 import os
 import numpy as np
 import pandas as pd
@@ -13,12 +13,13 @@ from sklearn.model_selection import StratifiedKFold
 # One row per truck, so this uses every truck and still trains in minutes.
 DATA_DIR = os.environ.get("SCANIA_DIR", "/Volumes/workspace/bronze/raw_data/")
 K = 20
+# SCANIA's published prices. A miss costs 200-500. A false check costs 7-10.
 COST = np.array([
-    [0, 500, 1000, 2000, 4000],
-    [500, 0, 500, 1000, 2000],
-    [1000, 500, 0, 500, 1000],
-    [2000, 1000, 500, 0, 500],
-    [4000, 2000, 1000, 500, 0],
+    [0, 7, 8, 9, 10],
+    [200, 0, 7, 8, 9],
+    [300, 200, 0, 7, 8],
+    [400, 300, 200, 0, 7],
+    [500, 400, 300, 200, 0],
 ], dtype=np.float64)
 
 def total_cost(y, pred):
@@ -101,40 +102,30 @@ def summarize(ops):
     print(f"  {frame.shape[0]:,} trucks, {frame.shape[1] - 1} sensor summaries")
     return frame
 
-def choose_fraction(prob, y, target_counts):
-    """Pick how many trucks to flag, and whether the flag is class 1 or class 2.
+def undo_weight(p, weight):
+    """Turn the weighted chance back into the training fleet's real chance.
 
-    Held-out training trucks are about 10% failures. The validation snapshot is
-    about 97% healthy. Each draw keeps every healthy held-out truck and a
-    failure sample at the validation rate, then we keep the flag rate whose
-    worst draw is cheapest.
+    The weight made each failure count like several trucks, so the printed
+    chance is too high. weight is (healthy trucks / failing trucks) from that fold.
     """
-    y = np.asarray(y, int)
-    rng = np.random.default_rng(0)
-    pool = {c: np.flatnonzero(y == c) for c in range(5)}
-    n0 = len(pool[0])
-    keep_n = {0: n0}
-    for c in range(1, 5):
-        keep_n[c] = min(len(pool[c]), max(1, int(round(n0 * target_counts[c] / target_counts[0]))))
-    fracs = [0.0005, 0.001, 0.002, 0.003, 0.004, 0.006, 0.008, 0.01, 0.015]
-    best = None
-    for frac in fracs:
-        for cls in (1, 2):
-            costs = []
-            for _draw in range(12):
-                chosen = [pool[0]]
-                for c in range(1, 5):
-                    chosen.append(rng.choice(pool[c], size=keep_n[c], replace=False))
-                idx = np.concatenate(chosen)
-                k = max(1, int(round(frac * len(idx))))
-                pred = np.zeros(len(idx), int)
-                pred[np.argsort(prob[idx])[::-1][:k]] = cls
-                costs.append(total_cost(y[idx], pred) * (target_counts[0] / n0))
-            worst, avg = float(np.max(costs)), float(np.mean(costs))
-            key = (worst, avg, frac)
-            if best is None or key < best[0]:
-                best = (key, frac, cls, avg, worst)
-    return best
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    return p / (p + (1 - p) * weight)
+
+
+def shift_prior(p, rate_from, rate_to):
+    """Move a chance from the training failure rate to the validation failure rate."""
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    odds = p / (1 - p)
+    odds *= (rate_to / (1 - rate_to)) / (rate_from / (1 - rate_from))
+    return odds / (1 + odds)
+
+
+def cheaper_class(p_fail):
+    """Put the failure chance on class 4, then pick the cheaper call."""
+    probs = np.zeros((len(p_fail), 5))
+    probs[:, 0] = 1 - p_fail
+    probs[:, 4] = p_fail
+    return np.argmin(probs @ COST, axis=1)
 
 print("Building one row per truck from the last 20 visits...")
 train_ops = load_ops("train_operational_readouts.csv")
@@ -175,7 +166,7 @@ X = Xtr[feats]
 Xv = Xva[feats]
 
 # The tree answers "is this truck inside a failure window?" One row is one truck.
-oof = np.zeros(len(y))
+# Each fold's weight is undone before the chances are averaged.
 val_prob = np.zeros(len(y_val))
 yy = (y > 0).astype(np.int8)
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -183,6 +174,7 @@ for fold, (tr, te) in enumerate(skf.split(X, yy), 1):
     print(f"Fold {fold}")
     pos = int(yy[tr].sum())
     neg = len(tr) - pos
+    weight = neg / max(pos, 1)
     model = lgb.LGBMClassifier(
         objective="binary",
         n_estimators=300,
@@ -190,36 +182,32 @@ for fold, (tr, te) in enumerate(skf.split(X, yy), 1):
         num_leaves=31,
         min_child_samples=50,
         colsample_bytree=0.5,
-        scale_pos_weight=neg / max(pos, 1),
+        scale_pos_weight=weight,
         random_state=42 + fold,
         n_jobs=-1,
         verbose=-1,
     )
     model.fit(X.iloc[tr], yy[tr])
-    oof[te] = model.predict_proba(X.iloc[te])[:, 1]
-    val_prob += model.predict_proba(Xv)[:, 1] / 5
+    val_prob += undo_weight(model.predict_proba(Xv)[:, 1], weight) / 5
 
-print(
-    "Held-out score, class 4 median/90th "
-    f"{np.median(oof[y == 4]):.3f}/{np.quantile(oof[y == 4], 0.9):.3f}  "
-    "healthy "
-    f"{np.median(oof[y == 0]):.3f}/{np.quantile(oof[y == 0], 0.9):.3f}"
-)
-
-(_key, frac, cls, avg, worst) = choose_fraction(oof, y, target_counts)
-k = max(1, int(round(frac * len(val_prob))))
-pred = np.zeros(len(val_prob), dtype=int)
-pred[np.argsort(val_prob)[::-1][:k]] = cls
+# Training ends with a failure about 1 time in 10. Validation is about 1 in 40.
+rate_from = float(yy.mean())
+rate_to = float((y_val > 0).mean())
+val_prob = shift_prior(val_prob, rate_from, rate_to)
+pred = cheaper_class(val_prob)
 flagged = y_val[pred > 0]
+n_fail = int((flagged > 0).sum())
+n_healthy = int((flagged == 0).sum())
 
 always = total_cost(y_val, np.zeros(len(y_val), dtype=int))
 cost = total_cost(y_val, pred)
 print()
 print("=== Validation Total Cost (Lower is Better) ===")
 print(f"Always healthy cost : {always:,.0f}")
-print(f"Flag top {frac:.2%} as class {cls} ({k} trucks)")
-print(f"Held-out worst draw : {worst:,.0f}   average draw {avg:,.0f}")
 print(f"Model cost          : {cost:,.0f}")
 print(f"Prediction counts   : {np.bincount(pred, minlength=5).tolist()}")
 print(f"True classes in the flagged trucks : {np.bincount(flagged, minlength=5).tolist()}")
+print(f"Flagged trucks      : {n_fail} failing, {n_healthy} healthy")
+if n_fail:
+    print(f"Healthy flags per failing truck : {n_healthy / n_fail:.1f}")
 print(f"Savings versus doing nothing : {always - cost:,.0f}")
